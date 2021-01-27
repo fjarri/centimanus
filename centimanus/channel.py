@@ -1,16 +1,29 @@
-import queue
+import trio
 
 
-class Channel:
+def open_channel(nursery):
+    send_channel, receive_channel = trio.open_memory_channel(0)
+    return SendChannel(send_channel, nursery), receive_channel
 
-    def __init__(self):
-        self._queue = queue.Queue()
 
-    def get(self, timeout=None):
-        return self._queue.get(timeout=timeout)
+class SendChannel:
 
-    def empty(self):
-        return self._queue.empty()
+    def __init__(self, send_channel, nursery):
+        self._token = trio.lowlevel.current_trio_token()
+        self._nursery = nursery
+        self._send_channel = send_channel
 
-    def put(self, value):
-        self._queue.put(value)
+    async def send(self, message):
+        if trio.lowlevel.current_trio_token() == self._token:
+            await self._send_channel.send(message)
+        else:
+            self.send_external(message)
+
+    def send_nowait(self, message):
+        if trio.lowlevel.current_trio_token() == self._token:
+            self._send_channel.send_nowait(message)
+        else:
+            self.send_external(message)
+
+    def send_external(self, message):
+        trio.from_thread.run_sync(self._nursery.start_soon, self._send_channel.send, message, trio_token=self._token)
