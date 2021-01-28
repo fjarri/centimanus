@@ -2,7 +2,7 @@ import trio
 
 
 def open_channel(nursery):
-    send_channel, receive_channel = trio.open_memory_channel(0)
+    send_channel, receive_channel = trio.open_memory_channel(100)
     return SendChannel(send_channel, nursery), receive_channel
 
 

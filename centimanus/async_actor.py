@@ -9,76 +9,6 @@ from .channel import open_channel
 from .future import Future, ThreadingFuture
 
 
-class TimedInbox:
-    def __init__(self):
-        self.keys = []
-        self.envelopes = []
-
-    def empty(self):
-        return len(self.keys) == 0
-
-    def add(self, envelope):
-        priority = 0 if envelope.target is None else 1
-        key = (envelope.timestamp, priority)
-        idx = bisect.bisect(self.keys, key)
-        self.keys.insert(idx, key)
-        self.envelopes.insert(idx, envelope)
-
-    def pop(self, ignore_targets):
-        for i in range(len(self.envelopes)):
-            if self.envelopes[i].target not in ignore_targets:
-                self.keys.pop(i)
-                return self.envelopes.pop(i)
-
-    def next_event_in(self, ignore_targets):
-
-        if len(self.keys) == 0:
-            return None
-
-        # TODO: we can maintain a dict of actor -> next message to speed it up
-        for envelope in self.envelopes:
-            if envelope.target not in ignore_targets:
-                return envelope.timestamp - time.monotonic()
-
-        return None
-
-    async def read_channel(self, channel, ignore_targets):
-
-        next_event_in = self.next_event_in(ignore_targets)
-
-        while True:
-
-            envelope = None
-            if next_event_in is None:
-                envelope = await channel.receive()
-            elif next_event_in > 0:
-                with trio.move_on_after(next_event_in):
-                    envelope = await channel.receive()
-
-            if envelope is not None:
-                self.add(envelope)
-
-            # Clean out the channel
-            # TODO: put a marker in it first, so that we're not stuck cleaning it out indefinitely,
-            # and instead take all the messages up to the marker.
-            while True:
-                try:
-                    envelope = channel.receive_nowait()
-                except trio.WouldBlock:
-                    break
-
-                self.add(envelope)
-
-            next_event_in = self.next_event_in(ignore_targets)
-            if next_event_in is not None and next_event_in <= 0:
-                break
-
-        # At this point there is something in the inbox to be processed right now,
-        # and with the target not in `ignored_targets`.
-
-        return self.pop(ignore_targets)
-
-
 class Envelope:
 
     def __init__(self, message, target=None, reply_to=None, delay=0):
@@ -180,7 +110,10 @@ class EventLoop:
 
     def __init__(self):
         self.actors = {} # actor id -> actor object
+        self.actor_channels = {} # actor id -> actor send channel
+        self.actor_cancels = {}
         self.children = {}
+
 
     def add_actor(self, parent_handle, actor_factory):
         root = parent_handle is None or parent_handle.id not in self.actors
@@ -193,12 +126,21 @@ class EventLoop:
         actor = actor_factory(self_handle)
 
         self.actors[actor_id] = actor
+
+        send_channel, receive_channel = trio.open_memory_channel(0)
+        self.actor_channels[actor_id] = send_channel
+
+        cancel_scope = trio.CancelScope()
+        self.actor_cancels[actor_id] = cancel_scope
+
         if parent_handle is not None:
             if parent_handle.id not in self.children:
                 self.children[parent_handle.id] = set()
             self.children[parent_handle.id].add(actor_id)
 
         print(f"  New children: {self.children}")
+
+        self._nursery.start_soon(self.actor_loop, cancel_scope, receive_channel)
 
         child_handle = ChildHandle(actor_id, self._nursery, self._channel)
         return child_handle
@@ -221,23 +163,49 @@ class EventLoop:
 
             del self.children[id]
 
+        print(f"Cancelling {id}")
+        self.actor_cancels[id].cancel()
         del self.actors[id]
 
-    async def process_message(self, envelope):
-        if envelope.target is None:
-            if isinstance(envelope.message, AddActor):
-                return self.add_actor(envelope.message.parent_handle, envelope.message.actor_factory)
-            elif isinstance(envelope.message, TerminateActor):
-                await self.terminate_actor(envelope.message.id)
-            elif isinstance(envelope.message, TerminateEventLoop):
-                self._nursery.cancel_scope.cancel()
+    async def on_message(self, message):
+        if isinstance(message, AddActor):
+            return self.add_actor(message.parent_handle, message.actor_factory)
+        elif isinstance(message, TerminateActor):
+            await self.terminate_actor(message.id)
+        elif isinstance(message, TerminateEventLoop):
+            self._nursery.cancel_scope.cancel()
         else:
-            return await self.actors[envelope.target].on_message(envelope.message)
+            raise Exception(f"Unknown message type: {type(message)}")
+
+    async def actor_loop(self, cancel_scope, receive_channel):
+
+        with cancel_scope:
+            while True:
+                envelope = await receive_channel.receive()
+                # TODO: process delay here
+                # TODO: process timeout here
+                await self.process_message_and_reply(self.actors[envelope.target].on_message, envelope)
+
+    async def process_message_and_reply(self, handler, envelope):
+        try:
+            result = await handler(envelope.message)
+            print(f"Processed {envelope.message}: {result}")
+
+            if envelope.reply_to is not None:
+                if isinstance(envelope.reply_to, Future):
+                    await envelope.reply_to.set(result)
+                else:
+                    envelope.reply_to.set_sync(result)
+
+        except Exception as e:
+            print(f"Processed {envelope.message}: failed with {e}")
+            if envelope.reply_to is not None:
+                if isinstance(envelope.reply_to, Future):
+                    await envelope.reply_to.set_exception()
+                else:
+                    envelope.reply_to.set_exception_sync()
 
     async def run_async(self, service_channel):
-
-        active_actors = set()
-        inbox = TimedInbox()
 
         async with trio.open_nursery() as nursery:
 
@@ -249,50 +217,11 @@ class EventLoop:
             service_channel.put(send_channel)
 
             while True:
-
-                with trio.CancelScope() as channel_cancel_scope:
-                    envelope = await inbox.read_channel(receive_channel, set(active_actors))
-
-                # if we're here, it's one of:
-                # - there's a message to process
-                # - an actor is finished and cancelled it
-
-                if nursery.cancel_scope.cancelled_caught:
-                    break
-
-                if channel_cancel_scope.cancelled_caught:
-                    # start waiting for the next event with the updated set of active actors
-                    continue
-
-                async def process_message(envelope):
-                    try:
-                        result = await self.process_message(envelope)
-                        print(f"Processed {envelope.message}: {result}")
-
-                        if envelope.reply_to is not None:
-                            if isinstance(envelope.reply_to, Future):
-                                await envelope.reply_to.set(result)
-                            else:
-                                envelope.reply_to.set_sync(result)
-
-                    except Exception as e:
-                        print(f"Processed {envelope.message}: failed with {e}")
-                        if envelope.reply_to is not None:
-                            if isinstance(envelope.reply_to, Future):
-                                await envelope.reply_to.set_exception()
-                            else:
-                                envelope.reply_to.set_exception_sync()
-
-                    if envelope.target is not None:
-                        active_actors.remove(envelope.target)
-                        channel_cancel_scope.cancel()
-
-                print("Event loop got message", envelope.message)
-
+                envelope = await receive_channel.receive()
                 if envelope.target is not None:
-                    active_actors.add(envelope.target)
-
-                nursery.start_soon(process_message, envelope)
+                    await self.actor_channels[envelope.target].send(envelope)
+                else:
+                    nursery.start_soon(self.process_message_and_reply, self.on_message, envelope)
 
             # TODO: here we would lock the channel, respond to late messages etc
 
